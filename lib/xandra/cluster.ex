@@ -1,8 +1,8 @@
 defmodule Xandra.Cluster do
   @moduledoc """
-  A `DBConnection.Pool` pool that implements clustering support.
+  A `DBConnection.ConnectionPool` pool that implements clustering support.
 
-  This module implements a `DBConnection.Pool` pool that implements support for
+  This module implements a `DBConnection.ConnectionPool` pool that implements support for
   connecting to multiple nodes and executing queries on such nodes based on a
   given "strategy".
 
@@ -29,7 +29,7 @@ defmodule Xandra.Cluster do
       Xandra.start_link([
         nodes: ["cassandra1.example.net", "cassandra2.example.net"],
         pool: Xandra.Cluster,
-        underlying_pool: DBConnection.Poolboy,
+        underlying_pool: DBConnection.ConnectionPool,
         pool_size: 10,
       ])
 
@@ -68,7 +68,7 @@ defmodule Xandra.Cluster do
   These are the options that `Xandra.start_link/1` accepts when
   `pool: Xandra.Cluster` is passed to it:
 
-    * `:underlying_pool` - (module) the `DBConnection.Pool` pool used to pool
+    * `:underlying_pool` - (module) the `DBConnection.ConnectionPool` pool used to pool
       connections to each of the specified nodes.
 
     * `:load_balancing` - (atom) load balancing "strategy". Defaults to `:random`.
@@ -79,13 +79,12 @@ defmodule Xandra.Cluster do
 
   use GenServer
 
-  @behaviour DBConnection.Pool
-
-  @default_pool_module DBConnection.Connection
+  @default_pool_module DBConnection.ConnectionPool
   @default_load_balancing :random
 
   alias __MODULE__.{ControlConnection, StatusChange}
   alias Xandra.ConnectionError
+  alias DBConnection.Holder
 
   require Logger
 
@@ -105,6 +104,10 @@ defmodule Xandra.Cluster do
 
   def child_spec(module, options, child_options) do
     Supervisor.Spec.worker(__MODULE__, [module, options], child_options)
+  end
+
+  def start_link({connection, options}) do
+    start_link(connection, options)
   end
 
   def start_link(Xandra.Connection, options) do
@@ -185,6 +188,30 @@ defmodule Xandra.Cluster do
     {:noreply, toggle_pool(state, status_change)}
   end
 
+  def handle_info({:db_connection, from, {:checkout, _caller, _now, _queue?}} = msg, %__MODULE__{} = state) do
+    %{
+      node_refs: node_refs,
+      load_balancing: load_balancing,
+      pool_module: pool_module,
+      pools: pools
+    } = state
+
+    if Enum.empty?(pools) do
+        action = "checkout from cluster #{inspect(name())}"
+        err = ConnectionError.new(action, {:cluster, :not_connected})
+        Holder.reply_error(from, err)
+    else
+      pool = select_pool(load_balancing, pools, node_refs)
+      send(pool, msg)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(msg, state) do
+    {:noreply, state}
+  end
+
   defp start_control_connections(nodes, options) do
     cluster = self()
 
@@ -205,7 +232,7 @@ defmodule Xandra.Cluster do
     } = state
 
     options = [address: address, port: port] ++ options
-    child_spec = pool_module.child_spec(Xandra.Connection, options, id: address)
+    child_spec = pool_module.child_spec({Xandra.Connection, options})
 
     case Supervisor.start_child(pool_supervisor, child_spec) do
       {:ok, pool} ->
